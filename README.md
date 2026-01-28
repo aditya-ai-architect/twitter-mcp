@@ -32,9 +32,11 @@ Built with TypeScript, `@modelcontextprotocol/sdk`, and Zod for runtime validati
 
 - **Full Twitter access** — Read timelines, search, view profiles, post tweets, like, retweet, reply
 - **Cookie-based auth** — No Twitter Developer account or OAuth app required
+- **Anti-bot bypass** — Write operations use Puppeteer with stealth plugin to bypass Twitter's automation detection
+- **Dual-engine** — Fast HTTP for reads, headless browser for writes
 - **Clean responses** — Deeply nested Twitter GraphQL responses are parsed into simple, readable JSON
 - **Type-safe** — Written in strict TypeScript with Zod schema validation on all tool inputs
-- **Lightweight** — Zero bloat, 3 source files, minimal dependencies
+- **Auto ct0 refresh** — CSRF tokens are refreshed transparently when Twitter rotates them
 - **MCP standard** — Works with any MCP-compatible client (Claude Desktop, Claude Code, etc.)
 
 ---
@@ -352,23 +354,40 @@ twitter-mcp/
 ## Architecture
 
 ```
-┌─────────────────┐     stdio      ┌─────────────────┐    GraphQL     ┌─────────────┐
-│   MCP Client    │ ◄────────────► │  twitter-mcp    │ ◄────────────► │  x.com API  │
-│ (Claude, etc.)  │   JSON-RPC     │  MCP Server     │   HTTP + cookies│  (GraphQL)  │
-└─────────────────┘                └─────────────────┘                └─────────────┘
+┌─────────────────┐     stdio      ┌─────────────────┐
+│   MCP Client    │ ◄────────────► │  twitter-mcp    │
+│ (Claude, etc.)  │   JSON-RPC     │  MCP Server     │
+└─────────────────┘                └────────┬────────┘
+                                            │
+                              ┌─────────────┴─────────────┐
+                              │                           │
+                      ┌───────▼───────┐          ┌────────▼────────┐
+                      │  undici HTTP  │          │   Puppeteer +   │
+                      │  (Read ops)   │          │   Stealth       │
+                      │  Fast, direct │          │   (Write ops)   │
+                      └───────┬───────┘          └────────┬────────┘
+                              │                           │
+                              └─────────────┬─────────────┘
+                                            │
+                                   ┌────────▼────────┐
+                                   │   x.com API     │
+                                   │   (GraphQL)     │
+                                   └─────────────────┘
 ```
 
 **How it works:**
 
-1. The MCP client (Claude Desktop, Claude Code, etc.) connects to the server via **stdio**
-2. When a tool is called, the server constructs an authenticated request using your cookies
-3. Requests hit Twitter's internal **GraphQL API** (`x.com/i/api/graphql/...`) — the same endpoints the web client uses
-4. Raw responses are parsed into clean, simplified JSON and returned to the client
+The server uses a **dual-engine approach** to handle Twitter's anti-bot detection:
 
-**Authentication flow per request:**
-- `Cookie` header carries `auth_token` and `ct0`
-- `x-csrf-token` header matches the `ct0` value
-- `Authorization` header uses Twitter's public web client Bearer token
+- **Read operations** (timeline, search, profiles) use fast direct HTTP requests via `undici` — no browser needed
+- **Write operations** (post, like, retweet, reply) use a headless **Puppeteer** browser with the **stealth plugin** to bypass Twitter's automation detection (error 226)
+
+The stealth browser launches lazily on the first write call and stays alive for subsequent operations.
+
+**Authentication:**
+- Cookies (`auth_token` + `ct0`) are set on the browser session and HTTP client
+- `ct0` is automatically refreshed when Twitter rotates it
+- CSRF mismatches are detected and retried transparently
 
 ---
 
@@ -385,6 +404,12 @@ You've hit Twitter's rate limit. Wait a few minutes before trying again. Differe
 
 ### Empty responses / no tweets returned
 Twitter occasionally changes GraphQL query IDs when deploying updates. The hardcoded query IDs in `src/twitter-client.ts` may need to be refreshed. You can extract current query IDs from Twitter's web client JavaScript bundles using browser DevTools (Network tab → filter by `graphql`).
+
+### Error 226 "This request looks like it might be automated"
+Write operations use a stealth Puppeteer browser to bypass this. If you still see this error, your account may have temporary restrictions — try posting manually once from your browser, then retry.
+
+### Browser launch failures
+The first write operation launches a Chromium browser. Ensure you have enough memory and that Puppeteer's bundled Chromium was downloaded during `npm install`. On Linux servers, you may need additional system libraries — see [Puppeteer troubleshooting](https://pptr.dev/troubleshooting).
 
 ### Server won't start in Claude Desktop
 - Ensure the path in your config uses **absolute paths**

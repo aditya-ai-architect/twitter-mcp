@@ -12,12 +12,19 @@
     "start": "node build/index.js",
     "dev": "tsc --watch"
   },
-  "keywords": ["mcp", "twitter", "x"],
+  "keywords": [
+    "mcp",
+    "twitter",
+    "x"
+  ],
   "author": "Aditya Gaurav",
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
     "dotenv": "^17.2.3",
+    "puppeteer": "^24.36.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "zod": "^4.3.6"
   },
   "devDependencies": {

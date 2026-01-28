@@ -1,4 +1,11 @@
+import { request } from "undici";
+import puppeteerExtra from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import type { Browser, Page } from "puppeteer";
 import type { Tweet, UserProfile, TrendItem } from "./types.js";
+
+const puppeteer = puppeteerExtra as any;
+puppeteer.use(StealthPlugin());
 
 const BEARER_TOKEN =
   "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -29,10 +36,15 @@ const DEFAULT_FEATURES: Record<string, boolean> = {
   longform_notetweets_rich_text_read_enabled: true,
   longform_notetweets_inline_media_enabled: true,
   responsive_web_enhance_cards_enabled: false,
+  highlights_tweets_tab_ui_enabled: true,
+  responsive_web_twitter_article_notes_tab_enabled: true,
+  subscriptions_verification_info_is_identity_verified_enabled: true,
+  hidden_profile_subscriptions_enabled: true,
+  subscriptions_verification_info_verified_since_enabled: true,
+  subscriptions_feature_can_gift_premium: true,
+  tweetypie_unmention_optimization_enabled: true,
 };
 
-// Query IDs sourced from Twitter's web client JS bundles.
-// These may change when Twitter deploys updates.
 const QUERY_IDS: Record<string, string> = {
   HomeTimeline: "HJFjzBgCs16TqxewQOeLNg",
   HomeLatestTimeline: "DiTkXJgAKXcS_buyLnSPCA",
@@ -52,11 +64,262 @@ const QUERY_IDS: Record<string, string> = {
 export class TwitterClient {
   private authToken: string;
   private ct0: string;
+  private browser: Browser | null = null;
+  private page: Page | null = null;
 
   constructor(authToken: string, ct0: string) {
     this.authToken = authToken;
     this.ct0 = ct0;
   }
+
+  // ── Puppeteer browser (lazy init, for write ops) ──────────────────
+
+  private async getBrowserPage(): Promise<Page> {
+    if (this.page && this.browser?.connected) return this.page;
+
+    console.error("[twitter-mcp] Launching stealth browser...");
+    this.browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--window-size=1920,1080",
+      ],
+      defaultViewport: { width: 1920, height: 1080 },
+    });
+
+    this.page = await this.browser!.newPage();
+    await this.page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    );
+
+    await this.page.setCookie(
+      {
+        name: "auth_token",
+        value: this.authToken,
+        domain: ".x.com",
+        path: "/",
+        httpOnly: true,
+        secure: true,
+      },
+      {
+        name: "ct0",
+        value: this.ct0,
+        domain: ".x.com",
+        path: "/",
+        secure: true,
+      },
+    );
+
+    await this.page.goto("https://x.com/home", {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
+
+    // Refresh ct0 from browser
+    const cookies = await this.page.cookies("https://x.com");
+    const freshCt0 = cookies.find((c) => c.name === "ct0");
+    if (freshCt0 && freshCt0.value !== this.ct0) {
+      console.error("[twitter-mcp] ct0 refreshed via browser");
+      this.ct0 = freshCt0.value;
+    }
+
+    console.error("[twitter-mcp] Browser ready");
+    return this.page;
+  }
+
+  /**
+   * Navigate a tweet by composing through the Twitter UI using Puppeteer.
+   * Uses Ctrl+Enter to submit — fully bypasses anti-bot detection.
+   */
+  private async browserComposeTweet(text: string, replyToTweetId?: string): Promise<string> {
+    const page = await this.getBrowserPage();
+
+    if (replyToTweetId) {
+      // Navigate to the tweet and click reply
+      await page.goto(`https://x.com/i/status/${replyToTweetId}`, {
+        waitUntil: "networkidle2",
+        timeout: 30000,
+      });
+      // Click the reply button
+      const replyButton = await page.waitForSelector(
+        `[data-testid="reply"]`,
+        { timeout: 10000 },
+      );
+      if (replyButton) await replyButton.click();
+      await new Promise((r) => setTimeout(r, 1500));
+    } else {
+      await page.goto("https://x.com/compose/post", {
+        waitUntil: "networkidle2",
+        timeout: 30000,
+      });
+    }
+
+    // Wait for compose textbox
+    const textbox = await page.waitForSelector(
+      '[data-testid="tweetTextarea_0"], [role="textbox"]',
+      { timeout: 15000 },
+    );
+    if (!textbox) throw new Error("Could not find compose textbox");
+
+    await textbox.click();
+    await new Promise((r) => setTimeout(r, 500));
+
+    // Type the tweet line by line
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === "" && i > 0) {
+        await page.keyboard.press("Enter");
+      } else if (line !== "") {
+        await page.keyboard.type(line, { delay: 8 });
+        if (i < lines.length - 1) {
+          await page.keyboard.press("Enter");
+        }
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Dismiss any autocomplete dropdown
+    await page.keyboard.press("Escape");
+    await new Promise((r) => setTimeout(r, 500));
+
+    // Submit with Ctrl+Enter
+    await page.keyboard.down("Control");
+    await page.keyboard.press("Enter");
+    await page.keyboard.up("Control");
+
+    // Wait for confirmation
+    await new Promise((r) => setTimeout(r, 5000));
+
+    // Verify post was sent by checking for confirmation text
+    const pageText = await page.evaluate(() => document.body.innerText);
+    if (pageText.includes("Your post was sent") || pageText.includes("Your reply was sent")) {
+      return "success";
+    }
+
+    // Check if we got redirected away from compose
+    const currentUrl = page.url();
+    if (!currentUrl.includes("compose")) {
+      return "success";
+    }
+
+    return "unknown";
+  }
+
+  /**
+   * Execute a GraphQL mutation through Puppeteer's browser context.
+   * Used for like/unlike/retweet/unretweet where UI interaction isn't needed.
+   */
+  private async browserGraphqlPost(
+    queryId: string,
+    operationName: string,
+    variables: Record<string, unknown>,
+    features: Record<string, boolean> = DEFAULT_FEATURES,
+  ): Promise<unknown> {
+    const page = await this.getBrowserPage();
+
+    const cookies = await page.cookies("https://x.com");
+    const ct0Cookie = cookies.find((c) => c.name === "ct0");
+    if (ct0Cookie) this.ct0 = ct0Cookie.value;
+
+    const url = `${GRAPHQL_BASE}/${queryId}/${operationName}`;
+    const payload = JSON.stringify({ variables, features, queryId });
+    const ct0 = this.ct0;
+    const bearer = BEARER_TOKEN;
+
+    const result = await page.evaluate(
+      async (url: string, payload: string, ct0: string, bearer: string) => {
+        const res = await fetch(url, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            Authorization: `Bearer ${bearer}`,
+            "Content-Type": "application/json",
+            "x-csrf-token": ct0,
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "en",
+          },
+          body: payload,
+        });
+        return { status: res.status, body: await res.text() };
+      },
+      url,
+      payload,
+      ct0,
+      bearer,
+    );
+
+    if (result.status >= 400) {
+      throw new Error(`Twitter API error ${result.status}: ${result.body}`);
+    }
+
+    return JSON.parse(result.body);
+  }
+
+  /**
+   * Like/unlike/retweet via the Twitter UI using data-testid buttons.
+   */
+  private async browserInteractWithTweet(
+    tweetId: string,
+    action: "like" | "unlike" | "retweet" | "unretweet",
+  ): Promise<boolean> {
+    const page = await this.getBrowserPage();
+
+    await page.goto(`https://x.com/i/status/${tweetId}`, {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
+
+    await new Promise((r) => setTimeout(r, 2000));
+
+    let testId: string;
+    switch (action) {
+      case "like":
+        testId = "like";
+        break;
+      case "unlike":
+        testId = "unlike";
+        break;
+      case "retweet":
+      case "unretweet":
+        testId = "retweet";
+        break;
+    }
+
+    const button = await page.waitForSelector(
+      `[data-testid="${testId}"]`,
+      { timeout: 10000 },
+    );
+    if (!button) return false;
+
+    await button.click();
+
+    if (action === "retweet") {
+      // Retweet shows a menu — click "Repost"
+      await new Promise((r) => setTimeout(r, 1000));
+      const repostOption = await page.waitForSelector(
+        '[data-testid="retweetConfirm"]',
+        { timeout: 5000 },
+      );
+      if (repostOption) await repostOption.click();
+    } else if (action === "unretweet") {
+      await new Promise((r) => setTimeout(r, 1000));
+      const undoOption = await page.waitForSelector(
+        '[data-testid="unretweetConfirm"]',
+        { timeout: 5000 },
+      );
+      if (undoOption) await undoOption.click();
+    }
+
+    await new Promise((r) => setTimeout(r, 2000));
+    return true;
+  }
+
+  // ── HTTP requests via undici (for read ops) ───────────────────────
 
   private get headers(): Record<string, string> {
     return {
@@ -72,6 +335,56 @@ export class TwitterClient {
     };
   }
 
+  private refreshCt0(resHeaders: Record<string, string | string[] | undefined>): void {
+    const setCookie = resHeaders["set-cookie"];
+    const cookies = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
+    for (const c of cookies) {
+      if (c.startsWith("ct0=")) {
+        const newCt0 = c.split(";")[0].replace("ct0=", "");
+        if (newCt0 && newCt0 !== this.ct0) {
+          console.error("[twitter-mcp] ct0 refreshed");
+          this.ct0 = newCt0;
+        }
+      }
+    }
+  }
+
+  private async httpRequest(
+    url: string,
+    method: "GET" | "POST",
+    body?: string,
+  ): Promise<{ status: number; data: unknown }> {
+    const { statusCode, headers, body: resBody } = await request(url, {
+      method,
+      headers: this.headers,
+      body,
+    });
+
+    this.refreshCt0(headers as Record<string, string | string[] | undefined>);
+    const text = await resBody.text();
+
+    if (statusCode === 403 && text.includes("353")) {
+      console.error("[twitter-mcp] CSRF mismatch, retrying with refreshed ct0...");
+      const retry = await request(url, {
+        method,
+        headers: this.headers,
+        body,
+      });
+      this.refreshCt0(retry.headers as Record<string, string | string[] | undefined>);
+      const retryText = await retry.body.text();
+      if (!retry.statusCode.toString().startsWith("2")) {
+        throw new Error(`Twitter API error ${retry.statusCode}: ${retryText}`);
+      }
+      return { status: retry.statusCode, data: JSON.parse(retryText) };
+    }
+
+    if (statusCode >= 400) {
+      throw new Error(`Twitter API error ${statusCode}: ${text}`);
+    }
+
+    return { status: statusCode, data: JSON.parse(text) };
+  }
+
   private async graphqlGet(
     queryId: string,
     operationName: string,
@@ -84,35 +397,8 @@ export class TwitterClient {
     });
 
     const url = `${GRAPHQL_BASE}/${queryId}/${operationName}?${params}`;
-    const res = await fetch(url, { method: "GET", headers: this.headers });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Twitter API error ${res.status}: ${text}`);
-    }
-
-    return res.json();
-  }
-
-  private async graphqlPost(
-    queryId: string,
-    operationName: string,
-    variables: Record<string, unknown>,
-    features: Record<string, boolean> = DEFAULT_FEATURES,
-  ): Promise<unknown> {
-    const url = `${GRAPHQL_BASE}/${queryId}/${operationName}`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: this.headers,
-      body: JSON.stringify({ variables, features, queryId }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Twitter API error ${res.status}: ${text}`);
-    }
-
-    return res.json();
+    const { data } = await this.httpRequest(url, "GET");
+    return data;
   }
 
   // ── Response parsing helpers ──────────────────────────────────────
@@ -206,7 +492,6 @@ export class TwitterClient {
               ?.result;
 
           if (tweetResult) {
-            // Handle tweet with visibility results wrapper
             const innerResult =
               tweetResult.__typename === "TweetWithVisibilityResults"
                 ? tweetResult.tweet
@@ -215,7 +500,6 @@ export class TwitterClient {
             if (parsed) tweets.push(parsed);
           }
 
-          // Also handle conversation threads (items array)
           if (entry.content?.items) {
             for (const item of entry.content.items) {
               const nestedResult =
@@ -238,7 +522,7 @@ export class TwitterClient {
     return tweets;
   }
 
-  // ── Public API ────────────────────────────────────────────────────
+  // ── Public API — Read operations (fast HTTP via undici) ────────────
 
   async getHomeTimeline(count: number = 20): Promise<Tweet[]> {
     const data = await this.graphqlGet(
@@ -262,11 +546,7 @@ export class TwitterClient {
     return this.parseUser(data?.data?.user?.result);
   }
 
-  async getUserTweets(
-    username: string,
-    count: number = 20,
-  ): Promise<Tweet[]> {
-    // First get the user ID
+  async getUserTweets(username: string, count: number = 20): Promise<Tweet[]> {
     const profile = await this.getUserProfile(username);
     if (!profile) throw new Error(`User @${username} not found`);
 
@@ -302,10 +582,7 @@ export class TwitterClient {
     return this.parseTweet(innerResult);
   }
 
-  async searchTweets(
-    query: string,
-    count: number = 20,
-  ): Promise<Tweet[]> {
+  async searchTweets(query: string, count: number = 20): Promise<Tweet[]> {
     const data = await this.graphqlGet(
       QUERY_IDS.SearchTimeline,
       "SearchTimeline",
@@ -320,20 +597,12 @@ export class TwitterClient {
   }
 
   async getTrends(): Promise<TrendItem[]> {
-    // Trends use the v1.1 REST API
     const url = "https://x.com/i/api/2/guide.json?include_page_configuration=true&initial_tab_id=trending";
-    const res = await fetch(url, { method: "GET", headers: this.headers });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Twitter API error ${res.status}: ${text}`);
-    }
-
-    const data = (await res.json()) as any;
+    const { data } = await this.httpRequest(url, "GET");
     const trends: TrendItem[] = [];
 
     try {
-      const timeline = data?.timeline?.instructions ?? [];
+      const timeline = (data as any)?.timeline?.instructions ?? [];
       for (const instruction of timeline) {
         const entries = instruction.addEntries?.entries ?? [];
         for (const entry of entries) {
@@ -363,71 +632,37 @@ export class TwitterClient {
     return trends;
   }
 
-  async postTweet(
-    text: string,
-    replyToTweetId?: string,
-  ): Promise<Tweet | null> {
-    const variables: Record<string, unknown> = {
-      tweet_text: text,
-      dark_request: false,
-      media: { media_entities: [], possibly_sensitive: false },
-      semantic_annotation_ids: [],
-    };
+  // ── Public API — Write operations (via Puppeteer browser UI) ──────
 
-    if (replyToTweetId) {
-      variables.reply = {
-        in_reply_to_tweet_id: replyToTweetId,
-        exclude_reply_user_ids: [],
-      };
+  async postTweet(text: string, replyToTweetId?: string): Promise<string> {
+    const result = await this.browserComposeTweet(text, replyToTweetId);
+    if (result !== "success") {
+      throw new Error("Tweet may not have been posted — could not confirm");
     }
-
-    const data = (await this.graphqlPost(
-      QUERY_IDS.CreateTweet,
-      "CreateTweet",
-      variables,
-    )) as any;
-
-    const result = data?.data?.create_tweet?.tweet_results?.result;
-    return result ? this.parseTweet(result) : null;
+    return "Tweet posted successfully";
   }
 
   async likeTweet(tweetId: string): Promise<boolean> {
-    const data = (await this.graphqlPost(
-      QUERY_IDS.FavoriteTweet,
-      "FavoriteTweet",
-      { tweet_id: tweetId },
-      {},
-    )) as any;
-    return data?.data?.favorite_tweet === "Done";
+    return this.browserInteractWithTweet(tweetId, "like");
   }
 
   async unlikeTweet(tweetId: string): Promise<boolean> {
-    const data = (await this.graphqlPost(
-      QUERY_IDS.UnfavoriteTweet,
-      "UnfavoriteTweet",
-      { tweet_id: tweetId },
-      {},
-    )) as any;
-    return data?.data?.unfavorite_tweet === "Done";
+    return this.browserInteractWithTweet(tweetId, "unlike");
   }
 
   async retweet(tweetId: string): Promise<boolean> {
-    const data = (await this.graphqlPost(
-      QUERY_IDS.CreateRetweet,
-      "CreateRetweet",
-      { tweet_id: tweetId, dark_request: false },
-      {},
-    )) as any;
-    return !!data?.data?.create_retweet?.retweet_results?.result;
+    return this.browserInteractWithTweet(tweetId, "retweet");
   }
 
   async unretweet(tweetId: string): Promise<boolean> {
-    const data = (await this.graphqlPost(
-      QUERY_IDS.DeleteRetweet,
-      "DeleteRetweet",
-      { source_tweet_id: tweetId, dark_request: false },
-      {},
-    )) as any;
-    return !!data?.data?.unretweet?.source_tweet_results?.result;
+    return this.browserInteractWithTweet(tweetId, "unretweet");
+  }
+
+  async close(): Promise<void> {
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+      this.page = null;
+    }
   }
 }

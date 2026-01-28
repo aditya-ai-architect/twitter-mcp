@@ -122,15 +122,9 @@ server.registerTool("post_tweet", {
     reply_to_tweet_id: z.string().optional().describe("Tweet ID to reply to (optional)"),
   },
 }, async ({ text, reply_to_tweet_id }) => {
-  const tweet = await twitter.postTweet(text, reply_to_tweet_id);
-  if (!tweet) {
-    return {
-      content: [{ type: "text" as const, text: "Failed to post tweet" }],
-      isError: true,
-    };
-  }
+  const result = await twitter.postTweet(text, reply_to_tweet_id);
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(tweet, null, 2) }],
+    content: [{ type: "text" as const, text: result }],
   };
 });
 
@@ -205,15 +199,9 @@ server.registerTool("reply_to_tweet", {
     text: z.string().min(1).max(280).describe("The reply text content"),
   },
 }, async ({ tweet_id, text }) => {
-  const tweet = await twitter.postTweet(text, tweet_id);
-  if (!tweet) {
-    return {
-      content: [{ type: "text" as const, text: `Failed to reply to tweet ${tweet_id}` }],
-      isError: true,
-    };
-  }
+  const result = await twitter.postTweet(text, tweet_id);
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(tweet, null, 2) }],
+    content: [{ type: "text" as const, text: result }],
   };
 });
 
